@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,8 +100,10 @@ type Client struct {
 	CacheDir  string
 	UserAgent string
 	policy    downloadPolicy
-	httpOnce  sync.Once
-	dlHTTP    *http.Client
+	// hashFile can override whole-file hashing in focused package tests.
+	hashFile func(context.Context, string) (string, error)
+	httpOnce sync.Once
+	dlHTTP   *http.Client
 }
 
 type downloadPathLock struct {
@@ -316,6 +319,46 @@ func (c *Client) DownloadFile(ctx context.Context, f File, dest string, force, q
 }
 
 func (c *Client) downloadFile(ctx context.Context, f File, dest string, force, quiet bool, onBytes func(int), onAttemptProgress func(int64)) error {
+	return c.downloadFileWithResume(ctx, f, dest, force, quiet, onBytes, onAttemptProgress, false)
+}
+
+type downloadResume struct {
+	enabled  bool
+	path     string
+	offset   int64
+	total    int64
+	etag     string
+	source   string
+	eligible bool
+}
+
+func (r *downloadResume) cleanup() error {
+	if r == nil || r.path == "" {
+		return nil
+	}
+	return removeDownloadTemp(r.path)
+}
+
+func (r *downloadResume) reset() error {
+	if r == nil {
+		return nil
+	}
+	r.offset = 0
+	r.total = 0
+	r.etag = ""
+	r.source = ""
+	r.eligible = false
+	if r.path == "" {
+		return nil
+	}
+	f, err := os.OpenFile(r.path, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+func (c *Client) downloadFileWithResume(ctx context.Context, f File, dest string, force, quiet bool, onBytes func(int), onAttemptProgress func(int64), enableResume bool) (retErr error) {
 	if !force {
 		if ok, _ := matchesFileMetadata(f, dest); ok {
 			return nil
@@ -327,6 +370,16 @@ func (c *Client) downloadFile(ctx context.Context, f File, dest string, force, q
 
 	policy := c.policy.withDefaults()
 	client := c.downloadHTTPClient(policy)
+	resume := &downloadResume{enabled: enableResume}
+	defer func() {
+		if err := resume.cleanup(); err != nil {
+			if retErr == nil {
+				retErr = fmt.Errorf("download %s succeeded but temporary file cleanup failed: %w", f.Path, err)
+			} else {
+				retErr = fmt.Errorf("%v (temporary file cleanup failed: %w)", retErr, err)
+			}
+		}
+	}()
 	var last *downloadFailure
 	attempted := 0
 	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
@@ -334,7 +387,7 @@ func (c *Client) downloadFile(ctx context.Context, f File, dest string, force, q
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("download %s: %w", f.Path, err)
 		}
-		tmpPath, size, retryable, retryAfter, failure := c.downloadAttempt(ctx, client, policy, f, dest, onAttemptProgress)
+		tmpPath, size, retryable, retryAfter, failure := c.downloadAttempt(ctx, client, policy, f, dest, onAttemptProgress, resume)
 		if failure == nil {
 			if err := ctx.Err(); err != nil {
 				if cleanupErr := removeDownloadTemp(tmpPath); cleanupErr != nil {
@@ -379,10 +432,11 @@ func (c *Client) downloadFile(ctx context.Context, f File, dest string, force, q
 			notifyDownloadedBytes(onBytes, size)
 			return nil
 		}
-		if tmpPath != "" {
+		if tmpPath != "" && !(enableResume && retryable) {
 			if err := removeDownloadTemp(tmpPath); err != nil {
 				return fmt.Errorf("download %s failed after %d attempt(s): %s; temporary file %s cleanup failed: %w", f.Path, attempt, failure.reason, tmpPath, err)
 			}
+			resume.path = ""
 		}
 		last = failure
 		if !retryable || attempt == policy.maxAttempts {
@@ -493,7 +547,7 @@ func (c *Client) downloadHTTPClient(policy downloadPolicy) *http.Client {
 	return c.dlHTTP
 }
 
-func (c *Client) downloadAttempt(parent context.Context, client *http.Client, policy downloadPolicy, f File, dest string, onAttemptProgress func(int64)) (string, int64, bool, time.Duration, *downloadFailure) {
+func (c *Client) downloadAttempt(parent context.Context, client *http.Client, policy downloadPolicy, f File, dest string, onAttemptProgress func(int64), resume *downloadResume) (string, int64, bool, time.Duration, *downloadFailure) {
 	attemptCtx, cancelAttempt := context.WithTimeout(parent, policy.attemptTimeout)
 	defer cancelAttempt()
 	requestCtx, cancelRequest := context.WithCancel(attemptCtx)
@@ -505,6 +559,23 @@ func (c *Client) downloadAttempt(parent context.Context, client *http.Client, po
 	}
 	if c.UserAgent != "" {
 		request.Header.Set("User-Agent", c.UserAgent)
+	}
+	if resume != nil && resume.enabled {
+		request.Header.Set("Accept-Encoding", "identity")
+	}
+	resumeOffset := int64(0)
+	useRange := resume != nil && resume.enabled && resume.eligible && resume.offset > 0 && sameDownloadURL(f.URL, resume.source)
+	if useRange {
+		resumeOffset = resume.offset
+		request.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
+		request.Header.Set("If-Range", resume.etag)
+	}
+	requestClient := client
+	if useRange {
+		// A ranged request must never forward its validator to a redirect target.
+		copyClient := *client
+		copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		requestClient = &copyClient
 	}
 	var headerTimedOut atomic.Bool
 	var headerTimer *time.Timer
@@ -519,7 +590,7 @@ func (c *Client) downloadAttempt(parent context.Context, client *http.Client, po
 			cancelRequest()
 		})
 	}
-	response, err := client.Do(request)
+	response, err := requestClient.Do(request)
 	if headerTimer != nil {
 		if !headerTimer.Stop() {
 			// Wait for a racing timeout callback before inspecting its result.
@@ -569,22 +640,156 @@ func (c *Client) downloadAttempt(parent context.Context, client *http.Client, po
 		return "", 0, true, 0, &downloadFailure{reason: "attempt timed out", cause: attemptCtx.Err()}
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
+	if useRange && response.StatusCode >= 300 && response.StatusCode < 400 {
+		if err := resume.reset(); err != nil {
+			return resume.path, 0, false, 0, &downloadFailure{reason: "reset redirected range candidate failed", cause: err}
+		}
+		return resume.path, 0, true, 0, &downloadFailure{reason: "redirected range request; restarting without Range"}
+	}
+	if useRange && response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		total, ok := parseUnsatisfiedContentRange(response.Header.Values("Content-Range"))
+		etag, oneETag := singleHeaderValue(response.Header, "ETag")
+		if ok && oneETag && responseSourceMatches(response, f.URL, resume.source) && isStrongETag(etag) && etag == resume.etag && total == resume.total && resume.offset == total {
+			if err := c.verifyResumeCandidate(attemptCtx, resume.path, f, total); err == nil {
+				if err := parent.Err(); err != nil {
+					return resume.path, resume.offset, false, 0, &downloadFailure{reason: "request canceled while validating resumed file", cause: err}
+				}
+				if err := attemptCtx.Err(); err != nil {
+					return resume.path, resume.offset, true, 0, &downloadFailure{reason: "attempt timed out while validating resumed file", cause: err}
+				}
+				if err := finalizeResumeCandidate(resume.path); err != nil {
+					return resume.path, resume.offset, false, 0, &downloadFailure{reason: "finalize resumed file failed", cause: err}
+				}
+				if err := parent.Err(); err != nil {
+					return resume.path, resume.offset, false, 0, &downloadFailure{reason: "request canceled before commit", cause: err}
+				}
+				if err := attemptCtx.Err(); err != nil {
+					return resume.path, resume.offset, true, 0, &downloadFailure{reason: "attempt timed out before commit", cause: err}
+				}
+				return resume.path, total, false, 0, nil
+			} else if parent.Err() != nil {
+				return resume.path, resume.offset, false, 0, &downloadFailure{reason: "request canceled while validating resumed file", cause: parent.Err()}
+			} else if attemptCtx.Err() != nil {
+				return resume.path, resume.offset, true, 0, &downloadFailure{reason: "attempt timed out while validating resumed file", cause: attemptCtx.Err()}
+			}
+		}
+		if err := resume.reset(); err != nil {
+			return resume.path, 0, false, 0, &downloadFailure{reason: "reset invalid range candidate failed", cause: err}
+		}
+		return resume.path, 0, true, 0, &downloadFailure{reason: "HTTP 416; restarting without Range"}
+	}
+	if useRange && (response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusMethodNotAllowed || response.StatusCode == http.StatusNotImplemented) {
+		if err := resume.reset(); err != nil {
+			return resume.path, 0, false, 0, &downloadFailure{reason: "reset unsupported range candidate failed", cause: err}
+		}
+		return resume.path, 0, true, 0, &downloadFailure{reason: fmt.Sprintf("HTTP %d rejected Range; restarting without Range", response.StatusCode)}
+	}
+	if useRange && response.StatusCode == http.StatusOK {
+		if err := resume.reset(); err != nil {
+			return resume.path, 0, false, 0, &downloadFailure{reason: "reset ignored range candidate failed", cause: err}
+		}
+		useRange = false
+		resumeOffset = 0
+	}
+	var responseTotal int64
+	if useRange && response.StatusCode == http.StatusPartialContent {
+		start, end, total, rangeOK := parseContentRange(response.Header.Values("Content-Range"))
+		bodyLength := end - start + 1
+		etag, oneETag := singleHeaderValue(response.Header, "ETag")
+		encodings := response.Header.Values("Content-Encoding")
+		encodingOK := len(encodings) <= 1 && (len(encodings) == 0 || strings.EqualFold(strings.TrimSpace(encodings[0]), "identity"))
+		lengthOK := response.ContentLength < 0 || response.ContentLength == bodyLength
+		sizeOK := (f.Size <= 0 || total == f.Size) && total == resume.total
+		if !rangeOK || start != resume.offset || end != total-1 || !oneETag || !isStrongETag(etag) || etag != resume.etag || !responseSourceMatches(response, f.URL, resume.source) || !encodingOK || response.Uncompressed || !lengthOK || !sizeOK {
+			if err := resume.reset(); err != nil {
+				return resume.path, 0, false, 0, &downloadFailure{reason: "reset invalid range candidate failed", cause: err}
+			}
+			return resume.path, 0, true, 0, &downloadFailure{reason: "invalid or mismatched partial response; restarting without Range"}
+		}
+		responseTotal = total
+	} else if response.StatusCode != http.StatusOK {
 		retryable := response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500
 		var retryAfter time.Duration
 		if response.StatusCode == http.StatusTooManyRequests {
 			retryAfter = parseRetryAfter(response.Header.Get("Retry-After"))
 		}
-		return "", 0, retryable, retryAfter, &downloadFailure{
+		return resumePath(resume), 0, retryable, retryAfter, &downloadFailure{
 			reason: fmt.Sprintf("HTTP %d", response.StatusCode),
 		}
 	}
-
-	out, err := os.CreateTemp(filepath.Dir(dest), ".flashhub-download-")
-	if err != nil {
-		return "", 0, false, 0, &downloadFailure{reason: "create temporary file failed", cause: err}
+	if response.StatusCode == http.StatusPartialContent && !useRange {
+		if resume != nil && resume.enabled {
+			if err := resume.reset(); err != nil {
+				return resume.path, 0, false, 0, &downloadFailure{reason: "reset unexpected partial candidate failed", cause: err}
+			}
+			return resume.path, 0, true, 0, &downloadFailure{reason: "unexpected partial response; restarting without Range"}
+		}
+		return "", 0, false, 0, &downloadFailure{reason: "unexpected HTTP 206 response"}
 	}
-	tmpPath := out.Name()
+	if response.StatusCode == http.StatusOK && resume != nil && resume.enabled {
+		encodings := response.Header.Values("Content-Encoding")
+		if len(encodings) > 1 || (len(encodings) == 1 && !strings.EqualFold(strings.TrimSpace(encodings[0]), "identity")) || response.Uncompressed {
+			return resumePath(resume), 0, false, 0, &downloadFailure{reason: "compressed response is unsupported for bundle download"}
+		}
+		if f.Size > 0 && response.ContentLength >= 0 && f.Size != response.ContentLength {
+			return resumePath(resume), 0, false, 0, &downloadFailure{reason: fmt.Sprintf("size mismatch (response length %d, expected %d)", response.ContentLength, f.Size)}
+		}
+		if f.Size > 0 {
+			responseTotal = f.Size
+		} else if response.ContentLength >= 0 {
+			responseTotal = response.ContentLength
+		}
+		if resume.path != "" {
+			if err := resume.reset(); err != nil {
+				return resume.path, 0, false, 0, &downloadFailure{reason: "reset full download candidate failed", cause: err}
+			}
+		}
+		resume.offset = 0
+		resume.total = responseTotal
+		resume.etag, _ = singleHeaderValue(response.Header, "ETag")
+		resume.source = ""
+		if response.Request != nil && response.Request.URL != nil && sameDownloadURL(f.URL, response.Request.URL.String()) {
+			resume.source = response.Request.URL.String()
+			encodings := response.Header.Values("Content-Encoding")
+			encodingOK := len(encodings) == 0 || (len(encodings) == 1 && strings.EqualFold(strings.TrimSpace(encodings[0]), "identity"))
+			_, oneETag := singleHeaderValue(response.Header, "ETag")
+			resume.eligible = responseTotal > 0 && oneETag && isStrongETag(resume.etag) && !response.Uncompressed && encodingOK
+		} else {
+			resume.eligible = false
+		}
+	}
+	var out *os.File
+	tmpPath := ""
+	tempOperation := "create"
+	if resume != nil && resume.enabled {
+		if resume.path == "" {
+			out, err = os.CreateTemp(filepath.Dir(dest), ".flashhub-download-")
+			if err == nil {
+				resume.path = out.Name()
+			}
+		} else if useRange {
+			tempOperation = "open"
+			out, err = os.OpenFile(resume.path, os.O_WRONLY|os.O_APPEND, 0)
+		} else {
+			tempOperation = "open"
+			out, err = os.OpenFile(resume.path, os.O_WRONLY|os.O_TRUNC, 0)
+		}
+		tmpPath = resume.path
+	} else {
+		out, err = os.CreateTemp(filepath.Dir(dest), ".flashhub-download-")
+		if err == nil {
+			tmpPath = out.Name()
+		}
+	}
+	if err != nil {
+		return tmpPath, 0, false, 0, &downloadFailure{reason: tempOperation + " temporary file failed", cause: err}
+	}
+	if useRange && responseTotal == 0 {
+		responseTotal = resume.total
+	}
+	if !useRange && responseTotal == 0 && response.ContentLength >= 0 && resume != nil && resume.enabled {
+		responseTotal = response.ContentLength
+	}
 	closed := false
 	closeOut := func() error {
 		if closed {
@@ -598,11 +803,11 @@ func (c *Client) downloadAttempt(parent context.Context, client *http.Client, po
 	var writer io.Writer = out
 	var md5Hash hash.Hash
 	expectedMD5 := strings.TrimSpace(f.MD5)
-	if expectedMD5 != "" {
+	if expectedMD5 != "" && !useRange {
 		md5Hash = md5.New()
 		writer = io.MultiWriter(out, md5Hash)
 	}
-	var written int64
+	written := resumeOffset
 	var noProgressTimedOut atomic.Bool
 	progressTimer := time.AfterFunc(policy.noProgress, func() {
 		noProgressTimedOut.Store(true)
@@ -613,8 +818,15 @@ func (c *Client) downloadAttempt(parent context.Context, client *http.Client, po
 	for {
 		read, readErr := response.Body.Read(buffer)
 		if read > 0 {
+			if resume != nil && resume.enabled && responseTotal > 0 && written+int64(read) > responseTotal {
+				_ = closeOut()
+				return tmpPath, written, false, 0, &downloadFailure{reason: "response body exceeds expected length"}
+			}
 			n, writeErr := writer.Write(buffer[:read])
 			written += int64(n)
+			if resume != nil && resume.enabled {
+				resume.offset = written
+			}
 			if writeErr != nil {
 				_ = closeOut()
 				return tmpPath, written, false, 0, &downloadFailure{reason: "write temporary file failed", cause: writeErr}
@@ -665,11 +877,50 @@ func (c *Client) downloadAttempt(parent context.Context, client *http.Client, po
 	}
 	if f.Size > 0 && written != f.Size {
 		_ = closeOut()
+		if resume != nil && resume.enabled && written < f.Size {
+			return tmpPath, written, true, 0, &downloadFailure{reason: fmt.Sprintf("response body ended early (received %d bytes, expected %d)", written, f.Size)}
+		}
 		return tmpPath, written, false, 0, &downloadFailure{reason: fmt.Sprintf("size mismatch (received %d bytes, expected %d)", written, f.Size)}
+	}
+	if resume != nil && resume.enabled && responseTotal > 0 && written != responseTotal {
+		_ = closeOut()
+		if written < responseTotal {
+			return tmpPath, written, true, 0, &downloadFailure{reason: fmt.Sprintf("response body ended early (received %d bytes, expected response total %d)", written, responseTotal)}
+		}
+		return tmpPath, written, false, 0, &downloadFailure{reason: fmt.Sprintf("size mismatch (received %d bytes, expected response total %d)", written, responseTotal)}
 	}
 	if md5Hash != nil && !strings.EqualFold(hex.EncodeToString(md5Hash.Sum(nil)), expectedMD5) {
 		_ = closeOut()
 		return tmpPath, written, false, 0, &downloadFailure{reason: "MD5 mismatch"}
+	}
+	if useRange && expectedMD5 != "" {
+		if err := closeOut(); err != nil {
+			return tmpPath, written, false, 0, &downloadFailure{reason: "close temporary file failed", cause: err}
+		}
+		got, err := c.hashFileContext(attemptCtx, tmpPath)
+		if err != nil {
+			if parent.Err() != nil {
+				return tmpPath, written, false, 0, &downloadFailure{reason: "request canceled while validating resumed file", cause: parent.Err()}
+			}
+			if attemptCtx.Err() != nil {
+				return tmpPath, written, true, 0, &downloadFailure{reason: "attempt timed out while validating resumed file", cause: attemptCtx.Err()}
+			}
+			return tmpPath, written, false, 0, &downloadFailure{reason: "hash temporary file failed", cause: err}
+		}
+		if err := parent.Err(); err != nil {
+			return tmpPath, written, false, 0, &downloadFailure{reason: "request canceled while validating resumed file", cause: err}
+		}
+		if err := attemptCtx.Err(); err != nil {
+			return tmpPath, written, true, 0, &downloadFailure{reason: "attempt timed out while validating resumed file", cause: err}
+		}
+		if !strings.EqualFold(got, expectedMD5) {
+			return tmpPath, written, false, 0, &downloadFailure{reason: "MD5 mismatch"}
+		}
+		out, err = os.OpenFile(tmpPath, os.O_RDWR, 0)
+		if err != nil {
+			return tmpPath, written, false, 0, &downloadFailure{reason: "reopen temporary file failed", cause: err}
+		}
+		closed = false
 	}
 	if err := out.Chmod(0o644); err != nil {
 		_ = closeOut()
@@ -688,7 +939,175 @@ func (c *Client) downloadAttempt(parent context.Context, client *http.Client, po
 	if err := attemptCtx.Err(); err != nil {
 		return tmpPath, written, true, 0, &downloadFailure{reason: "attempt timed out", cause: err}
 	}
+	if resume != nil && resume.enabled {
+		resume.offset = written
+	}
 	return tmpPath, written, false, 0, nil
+}
+
+func resumePath(resume *downloadResume) string {
+	if resume == nil {
+		return ""
+	}
+	return resume.path
+}
+
+func isStrongETag(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return false
+	}
+	for _, b := range []byte(value[1 : len(value)-1]) {
+		if b == '"' || b < 0x21 || b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func singleHeaderValue(header http.Header, name string) (string, bool) {
+	values := header.Values(name)
+	if len(values) != 1 {
+		return "", false
+	}
+	return strings.TrimSpace(values[0]), true
+}
+
+func sameDownloadURL(a, b string) bool {
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	if errA != nil || errB != nil || ua == nil || ub == nil {
+		return false
+	}
+	if (ua.User == nil) != (ub.User == nil) {
+		return false
+	}
+	if ua.User != nil && ua.User.String() != ub.User.String() {
+		return false
+	}
+	return strings.EqualFold(ua.Scheme, ub.Scheme) && strings.EqualFold(ua.Host, ub.Host) && ua.EscapedPath() == ub.EscapedPath() && ua.RawQuery == ub.RawQuery
+}
+
+func responseSourceMatches(response *http.Response, requested, expected string) bool {
+	if response == nil || response.Request == nil || response.Request.URL == nil {
+		return false
+	}
+	actual := response.Request.URL.String()
+	return sameDownloadURL(requested, expected) && sameDownloadURL(actual, expected)
+}
+
+var contentRangePattern = regexp.MustCompile(`^bytes ([0-9]+)-([0-9]+)/([0-9]+)$`)
+var unsatisfiedContentRangePattern = regexp.MustCompile(`^bytes \*/([0-9]+)$`)
+
+func parseContentRange(values []string) (start, end, total int64, ok bool) {
+	if len(values) != 1 {
+		return 0, 0, 0, false
+	}
+	m := contentRangePattern.FindStringSubmatch(strings.TrimSpace(values[0]))
+	if m == nil {
+		return 0, 0, 0, false
+	}
+	values64 := make([]int64, 3)
+	for i := range values64 {
+		n, err := strconv.ParseInt(m[i+1], 10, 64)
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		values64[i] = n
+	}
+	if values64[0] < 0 || values64[1] < values64[0] || values64[2] <= values64[1] {
+		return 0, 0, 0, false
+	}
+	return values64[0], values64[1], values64[2], true
+}
+
+func parseUnsatisfiedContentRange(values []string) (int64, bool) {
+	if len(values) != 1 {
+		return 0, false
+	}
+	m := unsatisfiedContentRangePattern.FindStringSubmatch(strings.TrimSpace(values[0]))
+	if m == nil {
+		return 0, false
+	}
+	total, err := strconv.ParseInt(m[1], 10, 64)
+	return total, err == nil && total >= 0
+}
+
+func (c *Client) verifyResumeCandidate(ctx context.Context, path string, f File, total int64) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Size() != total {
+		return fmt.Errorf("candidate size %d does not match response total %d", info.Size(), total)
+	}
+	if f.Size > 0 && info.Size() != f.Size {
+		return fmt.Errorf("candidate size %d does not match indexed size %d", info.Size(), f.Size)
+	}
+	if strings.TrimSpace(f.MD5) != "" {
+		got, err := c.hashFileContext(ctx, path)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(got, strings.TrimSpace(f.MD5)) {
+			return errors.New("candidate MD5 mismatch")
+		}
+	}
+	return nil
+}
+
+func (c *Client) hashFileContext(ctx context.Context, path string) (string, error) {
+	if c.hashFile != nil {
+		return c.hashFile(ctx, path)
+	}
+	return fileMD5Context(ctx, path)
+}
+
+func fileMD5Context(ctx context.Context, path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := md5.New()
+	buf := make([]byte, 256*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			if _, err := h.Write(buf[:n]); err != nil {
+				return "", err
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return "", readErr
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func finalizeResumeCandidate(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func matchesFileMetadata(f File, path string) (bool, error) {
@@ -882,19 +1301,29 @@ func (c *Client) SyncBundle(ctx context.Context, repoURL, bundleDir, runtimeRel 
 
 	var wanted []File
 	var totalBytes int64
+	allSizesKnown := true
 	for _, f := range ix.Files {
 		if !WantFile(f.Path, runtimeRel, allRuntimeRels) {
 			continue
 		}
 		wanted = append(wanted, f)
-		totalBytes += f.Size
+		if f.Size <= 0 {
+			allSizesKnown = false
+		} else {
+			totalBytes += f.Size
+		}
+	}
+	if !allSizesKnown {
+		// A byte total that omits unknown files can reach 100% before the
+		// bundle is complete. Use completed-file progress for mixed indexes.
+		totalBytes = 0
 	}
 	st := progress.StartWithSink("sync", repoURL, progress.SinkFromContext(ctx))
 	st.Totals(len(wanted), totalBytes)
 	for _, f := range wanted {
 		dest := filepath.Join(bundleDir, filepath.FromSlash(f.Path))
 		fileProgress := &syncFileProgress{stage: st, fileSize: f.Size, totalBytes: totalBytes}
-		if err := c.downloadFile(ctx, f, dest, false, quiet, nil, fileProgress.update); err != nil {
+		if err := c.downloadFileWithResume(ctx, f, dest, false, quiet, nil, fileProgress.update, true); err != nil {
 			return nil, err
 		}
 		fileProgress.complete()
